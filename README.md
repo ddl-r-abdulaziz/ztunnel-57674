@@ -1,161 +1,128 @@
-# Ztunnel
+# fake-ztunnel
 
-Ztunnel provides an implementation of the ztunnel component of
-[ambient mesh](https://istio.io/latest/blog/2022/introducing-ambient-mesh/).
+A patched build of [`ztunnel`](https://github.com/istio/ztunnel) that turns
+one specific, otherwise-hard-to-reproduce race condition into something you
+can trigger deterministically, on demand, against a normal workload — with
+no changes to that workload's own configuration.
 
-## Feature Scope
+This reproduces [istio/istio#57674](https://github.com/istio/istio/issues/57674).
 
-Ztunnel is intended to be a purpose built implementation of the node proxy in [ambient mesh](https://istio.io/latest/blog/2022/introducing-ambient-mesh/).
-Part of the goals of this included keeping a narrow feature set, implementing only the bare minimum requirements for ambient.
-This ensures the project remains simple and high performance.
+## The race this reproduces
 
-Explicitly out of scope for ztunnel include:
-* Terminating user HTTP traffic
-* Terminating user HTTP traffic (its worth repeating)
-* Generic extensibility such as `ext_authz`, WASM, linked-in extensions, Lua, etc.
+The real `ztunnel` accepts a workload's very first connection (or DNS
+lookup routed through it) immediately, but doesn't yet know that
+workload's identity or routing info. It holds the connection open for a
+short timeout while it waits for that information to arrive, then either
+forwards the connection (if the info arrived in time) or drops it (if not).
+This is a genuine race: whether it resolves one way or the other depends on
+cluster and control-plane timing at the moment a workload starts, which
+makes it slow and unreliable to reproduce on purpose.
 
-In general, ztunnel does not aim to be a generic extensible proxy; Envoy is better suited for that task.
-If a feature is not directly used to implement the node proxy component in ambient mesh, it is unlikely to be accepted.
+This build makes that outcome deterministic for whichever workloads you
+choose, so you can find out what your own workload actually does when it
+happens — including cases where a workload doesn't crash, doesn't retry,
+and just quietly treats the failure as permanent (e.g. caching a failed DNS
+lookup as "unreachable," or striking something off an "available" list
+after one failed check at startup) — a class of bug that restart-count
+monitoring will never catch, because there was no restart.
 
-The details of architecture is [here](./ARCHITECTURE.md).
+## What it changes
+
+A single function, `wait_for_workload` in `src/state.rs`, is the one place
+both of ztunnel's workload-identity waits go through: the outbound
+connection path, and the DNS-proxy path that resolves a request's *source*
+workload. One small addition (`src/fake_race.rs`) intercepts calls to it
+for workloads in namespaces you choose, and forces them to fail for a
+configurable window of time — starting from that workload's very first
+attempt. Everything else is untouched, unpatched, stock `ztunnel` — every
+workload outside your chosen namespaces behaves exactly as it would with a
+real, unmodified image.
+
+## Behavior
+
+- The first time any workload in a targeted namespace has a connection or
+  DNS lookup wait on its identity, a window opens for that workload
+  (identified by namespace + name).
+- Every such wait for that workload, for as long as the window is open —
+  including the one that opened it — is forced to fail, as if the real
+  identity-wait had genuinely timed out. The failure surfaces through
+  completely unmodified code: whatever a real timeout looks like to a
+  client (a dropped connection, a DNS `SERVFAIL`, etc.) is exactly what
+  this produces too, since nothing downstream of the fault injection is
+  changed.
+- Once the window's duration has elapsed since it opened, that workload is
+  left alone permanently — every later wait for it (including one from a
+  container restart) falls through to the real, unmodified logic. A
+  workload that's fully replaced by a new pod with the same name and
+  namespace (e.g. after a rollout) is treated as the same workload, since
+  namespace + name is all this has to identify it by.
+- Every forced failure is logged (`fake_race: forcing identity-wait
+  timeout`, plus a distinct `fake_race: forced timeout waiting for
+  workload ...` warning at the point of failure) with the workload's
+  namespace, name, and how far into its window the call landed — ordinary
+  `ztunnel` logs, nothing extra to retrieve.
+
+## Configuration
+
+Set as environment variables on the process:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ZTUNNEL_FAKE_RACE_NAMESPACES` | unset (disabled) | Comma-separated list of namespaces to target. Workloads outside these namespaces are never affected. Leave unset to disable this behavior entirely and run as plain, unmodified `ztunnel`. |
+| `ZTUNNEL_FAKE_RACE_HOLD_SECS` | `6` | How long, in seconds, a targeted workload's window of forced failures lasts, counted from its first attempt. |
 
 ## Building
 
-Please use the same Rust version as the [`build-tools`](https://github.com/istio/tools/tree/master/docker/build-tools) image.
-You can determine the version that the `build-tools` image uses by running the below command:
-
-```shell
-$ BUILD_WITH_CONTAINER=1 make rust-version
+```
+docker build -t quay.io/rabdulaziz/ztunnel-57674:dev .
 ```
 
-### TLS/Crypto provider
+Produces a runtime image with the patched binary at
+`/usr/local/bin/ztunnel`, the same entrypoint a real `ztunnel` image
+exposes. Built from the pinned upstream tag this fork is based on;
+rebase onto a newer tag by fetching from the `upstream` remote and
+replaying the one commit that adds `src/fake_race.rs` and the small edit
+to `wait_for_workload` in `src/state.rs`.
 
-Ztunnel's TLS is built on [rustls](https://github.com/rustls/rustls).
+## Publishing
 
-Rustls has support for plugging in various crypto providers to meet various needs (compliance, performance, etc).
+No CI — build and push by hand:
 
-| Name                                               | How To Enable                                  |
-|----------------------------------------------------|------------------------------------------------|
-| [aws-lc](https://github.com/aws/aws-lc-rs)         | Default (or `--features tls-aws-lc`)           |
-| [ring](https://github.com/briansmith/ring/)        | `--features tls-ring --no-default-features`    |
-| [boring](https://github.com/cloudflare/boring)     | `--features tls-boring --no-default-features`  |
-| [openssl](https://github.com/tofay/rustls-openssl) | `--features tls-openssl --no-default-features` |
-
-In all options, only TLS 1.3 with cipher suites `TLS13_AES_256_GCM_SHA384` and `TLS13_AES_128_GCM_SHA256` is used.
-
-#### `boring` FIPS
-
-With the `boring` option, the FIPS version is used.
-Please note this only implies the specific version of the library is used; FIPS compliance requires more than *just* using a specific library.
-
-FIPS has
-[strict requirements](https://csrc.nist.gov/CSRC/media/projects/cryptographic-module-validation-program/documents/security-policies/140sp4407.pdf)
-to ensure that compliance is granted only to the exact binary tested.
-FIPS compliance was [granted](https://csrc.nist.gov/projects/cryptographic-module-validation-program/certificate/4407)
-to an old version of BoringSSL that was tested with `Clang 12.0.0`.
-
-Given that FIPS support will always have special environmental build requirements, we currently we work around this by vendoring OS/arch specific FIPS-compliant binary builds of `boringssl` in [](vendor/boringssl-fips/)
-
-We vendor FIPS boringssl binaries for
-
-- `linux/x86_64`
-- `linux/arm64`
-
-To use these vendored libraries and build ztunnel for either of these OS/arch combos, for the moment you must manually edit
-[.cargo/config.toml](.cargo/config.toml) and change the values of BORING_BSSL_PATH and BORING_BSSL_INCLUDE_PATH under the `[env]` key to match the path to the vendored libraries for your platform, e.g:
-
-##### For linux/x86_64
-
-``` toml
-BORING_BSSL_FIPS_PATH = { value = "vendor/boringssl-fips/linux_x86_64", force = true, relative = true }
-BORING_BSSL_FIPS_INCLUDE_PATH = { value = "vendor/boringssl-fips/include/", force = true, relative = true }
+```
+docker build -t quay.io/rabdulaziz/ztunnel-57674:latest .
+docker login quay.io
+docker push quay.io/rabdulaziz/ztunnel-57674:latest
 ```
 
-##### For linux/arm64
+## Deploying to a cluster
 
-``` toml
-BORING_BSSL_FIPS_PATH = { value = "vendor/boringssl-fips/linux_arm64", force = true, relative = true }
-BORING_BSSL_FIPS_INCLUDE_PATH = { value = "vendor/boringssl-fips/include/", force = true, relative = true }
+Point an ambient-mode cluster's `ztunnel` at this image instead of the real
+one. Two ways to do that, from quickest to most durable:
+
+**Quickest (good for a one-off test):**
+
+```
+kubectl -n istio-system set image daemonset/ztunnel istio-proxy=quay.io/rabdulaziz/ztunnel-57674:latest
 ```
 
-Once that's done, you should be able to build:
+Takes effect immediately against whatever ambient install is already
+running. It's a direct edit of the `ztunnel` DaemonSet, so it gets reverted
+the next time the installer reconciles or reinstalls ztunnel.
 
-``` shell
-cargo build
+**Durable (survives a reinstall), via istioctl:**
+
+```
+istioctl install --set profile=ambient --set values.ztunnel.image=quay.io/rabdulaziz/ztunnel-57674:latest
 ```
 
-This manual twiddling of environment vars is not ideal but given that the alternative is prefixing `cargo build` with these envs on every `cargo build/run`, for now we have chosen to hardcode these in `config.toml` - that may be revisited in the future depending on local pain and/or evolving `boring` upstream build flows.
+The ztunnel Helm chart treats a full `registry/repo:tag` string in
+`values.ztunnel.image` as a complete override, so this replaces the image at
+install time instead of just patching the running DaemonSet. The exact
+value path can shift between Istio versions — check yours first with
+`istioctl profile dump ambient | grep -A5 '^ztunnel:'`, and fall back to the
+`kubectl set image` method above if it doesn't match.
 
-Note that the Dockerfiles used to build these vendored `boringssl` builds may be found in the respective vendor directories, and can serve as a reference for the build environment needed to generate FIPS-compliant ztunnel builds.
-
-A release build with this option can be built with `TLS_MODE=boring ./scripts/release.sh`.
-
-## Development
-
-Please refer to [this](./Development.md).
-
-## Metrics
-
-Ztunnel exposes a variety of metrics, at varying levels of stability.  They are
-accessible by making an HTTP request to either "/stats/prometheus" or "/metrics" on port 15020.
-
-**Core** metrics are considered stable APIs.
-
-**Unstable** metrics may be changed. This includes removal, semantic changes, and label changes.
-
-### Core metrics
-
-#### Traffic metrics
-
-- Tcp Bytes Sent (`istio_tcp_sent_bytes_total`): This is a `COUNTER` which measures the size of total bytes sent during response in case of a TCP connection.
-- Tcp Bytes Received (`istio_tcp_received_bytes_total`): This is a `COUNTER` which measures the size of total bytes received during request in case of a TCP connection.
-- Tcp Connections Opened (`istio_tcp_connections_opened_total`): This is a `COUNTER` incremented for every opened connection.
-- Tcp Connections Closed (`istio_tcp_connections_closed_total`): This is a `COUNTER` incremented for every closed connection.
-
-#### Meta metrics
-
-- Istio build information (`istio_build`)
-
-### Unstable metrics
-
-#### DNS metrics
-
-- DNS Requests (`istio_dns_requests_total`)
-- DNS Upstream Requests (`istio_dns_upstream_requests_total`)
-- DNS Upstream Failures (`istio_dns_upstream_failures_total`)
-- DNS Upstream Request Duration (`istio_dns_upstream_request_duration_seconds`)
-- On Demand DNS Requests (`istio_on_demand_dns_total`)
-
-#### In-Pod metrics
-
-- Active proxy count (`istio_active_proxy_count_total`)
-- Pending proxy count (`istio_pending_proxy_count_total`)
-- Proxies started (`istio_proxies_started_total`)
-- Proxies stopped (`istio_proxies_stopped_total`)
-
-#### XDS metrics
-
-- XDS Connection terminations (`istio_xds_connection_terminations_total`)
-
-## Logging
-
-Ztunnel exposes a variety of logs, both operational and "access logs".
-
-Logs are controlled by the `RUST_LOG` variable.
-This can set all levels, or a specific target. For instance, `RUST_LOG=error,ztunnel::proxy=warn`.
-Logs can be emitted in JSON format with `LOG_FORMAT=json`.
-Access logs are under the `access` target.
-
-An example access log looks like (with newlines for readability; the real logs are on one line):
-
-```text
-2024-04-11T15:38:42.182974Z  INFO access: connection complete
-    src.addr=10.244.0.24:46238 src.workload="shell-6d8bcd654d-t88gp" src.namespace="default" src.identity="spiffe://cluster.local/ns/default/sa/default"
-    dst.addr=10.244.0.42:15008 dst.hbone_addr=10.96.108.116:80 dst.service="echo.default.svc.cluster.local"
-    direction="outbound" bytes_sent=67 bytes_recv=490 duration="13ms"
-```
-
-Access logs are emitted upon _completion_ of each connection.
-Logs for connect _establishment_ are also logged (with less information) at `debug` level.
-
-Currently, the access log format is considered unstable and subject to changes.
+Either way, no workload chart/pod-spec changes are needed — the fault
+injection is entirely on the proxy side. Once the image is in place, set
+`ZTUNNEL_FAKE_RACE_NAMESPACES` to your test namespace(s) and deploy a
+normal, unmodified workload into one of them.

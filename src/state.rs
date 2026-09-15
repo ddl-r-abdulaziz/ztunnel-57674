@@ -747,6 +747,12 @@ impl DemandProxyState {
         wl: &WorkloadInfo,
         deadline: Duration,
     ) -> Option<Arc<Workload>> {
+        if crate::fake_race::should_force_timeout(wl) {
+            tokio::time::sleep(deadline).await;
+            warn!("fake_race: forced timeout waiting for workload '{wl}' from xds");
+            return None;
+        }
+
         debug!(%wl, "wait for workload");
 
         // Take a watch listener *before* checking state (so we don't miss anything)

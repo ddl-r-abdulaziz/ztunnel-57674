@@ -24,6 +24,7 @@ pub mod config;
 pub mod copy;
 pub mod dns;
 pub mod drain;
+pub mod fake_race;
 pub mod hyper_util;
 pub mod identity;
 #[cfg(target_os = "linux")]
