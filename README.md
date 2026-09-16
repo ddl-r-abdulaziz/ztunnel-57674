@@ -74,15 +74,29 @@ Produces a runtime image with the patched binary at
 fork is based on; rebase onto a newer tag by fetching from the `upstream` remote and replaying the one commit that adds
 `src/fake_race.rs` and the small edit to `wait_for_workload` in `src/state.rs`.
 
+To confirm the image also builds for `arm64` without pushing anywhere (buildx can't load a multi-platform result into
+the local daemon, so this just verifies both platforms compile):
+
+```
+docker buildx build --platform linux/amd64,linux/arm64 -t quay.io/rabdulaziz/ztunnel-57674:dev .
+```
+
 ## Publishing
 
-No CI — build and push by hand:
+No CI — build and push by hand. Published images are multi-platform (`linux/amd64` + `linux/arm64`), which requires
+`docker buildx` and pushing straight to the registry (buildx can only emit multi-platform output to a registry, not
+the local daemon):
 
 ```
-docker build -t quay.io/rabdulaziz/ztunnel-57674:latest .
 docker login quay.io
-docker push quay.io/rabdulaziz/ztunnel-57674:latest
+docker buildx create --use --name ztunnel-builder   # first time only
+docker buildx build --platform linux/amd64,linux/arm64 \
+    -t quay.io/rabdulaziz/ztunnel-57674:latest \
+    --push .
 ```
+
+On Linux hosts without Docker Desktop, cross-arch emulation may need QEMU/binfmt registered first:
+`docker run --privileged --rm tonistiigi/binfmt --install all`.
 
 ## Deploying to a cluster
 
