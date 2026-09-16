@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-api-probe
+  labels:
+    app: kube-api-probe
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: curlimages/curl:8.10.1
+      command:
+        - sh
+        - -c
+        - |
+          i=0
+          echo "starting kube-api connectivity probe"
+          until curl -sS -o /dev/null --max-time 10 \
+              --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+              https://kubernetes.default.svc/healthz; do
+            i=$((i + 1))
+            echo "attempt $i failed at $(date -u +%H:%M:%S)"
+            sleep 2
+          done
+          echo "succeeded after $i failed attempt(s), at $(date -u +%H:%M:%S)"
